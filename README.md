@@ -1,8 +1,3 @@
-# MemoryAppPkg
-下面是你這份 **Memory Utility（Dump Memory Map / Allocate Pages / Allocate Pools / Hex Editor）** 的 **「函數使用方法筆記（README 版）」**。我用「你寫 UEFI 工具會用到的角度」整理：**每個功能怎麼用、按鍵、輸入格式、背後呼叫哪些 UEFI API、常見錯誤碼與原因、你可以怎麼擴充**。
-
----
-
 # README — Memory Utility (UEFI)
 
 ## 1. 這個工具能做什麼
@@ -253,6 +248,173 @@
 * 「Hex editor 寫入 → 用 GlobalIdx 防越界」
 
 ---
+
+## 1) 模組樹狀圖 TXT
+
+```txt
+Memory Utility (UEFI Application)
+│
+├── Entry / Main Loop
+│   ├── UefiMain()
+│   │   ├── SetNormalAttr()                 // 設定預設字體顏色
+│   │   └── Page_Main()                     // 主選單迴圈（直到 ESC 離開）
+│   │
+│   └── Page_Main()
+│       ├── MenuSelect("<<Select the action>>")
+│       │   ├── [0] Dump Memory Map  -> Page_DumpMemoryMap()
+│       │   └── [1] Allocate Memory  -> Page_AllocateMemory()
+│       └── (ESC) return -> UefiMain() exit
+│
+├── UI / Console Helpers
+│   ├── WaitAnyKey()                        // 等待任意鍵
+│   ├── SetNormalAttr()                     // 一般文字色
+│   ├── SetHighlightAttr()                  // 反白文字色（選取項目/游標）
+│   └── MenuSelect(Title, Items, Count)     // 上下鍵選單 UI（Enter=確認 / ESC=取消）
+│
+├── Input / Parsing
+│   ├── ReadLine(Buf, BufChars)             // 讀取一行輸入（Backspace/Enter/ESC）
+│   ├── ParseUint64(Str, *Out)              // 解析十進位/0x十六進位
+│   ├── PromptU64(Prompt, *Value)           // 印提示 + 讀數字（直到合法）
+│   └── PromptYesNo(Prompt, *Yes)           // 讀 y/n（ESC 取消）
+│
+├── Dump Memory Map Page
+│   └── Page_DumpMemoryMap()
+│       ├── gBS->GetMemoryMap()             // 兩段式：先取所需大小，再取實體表
+│       ├── gBS->AllocatePool()             // 分配 MemoryMap buffer
+│       ├── Print table (Type/Start/End/Pages)
+│       ├── Statistics TypePages[Type]      // 統計各 type pages
+│       └── gBS->FreePool(Map)              // 釋放 map buffer
+│
+├── Allocate Memory Page
+│   └── Page_AllocateMemory()
+│       ├── MenuSelect("<<Select allocate size>>")
+│       │   ├── [0] Allocate Pages -> AllocatePagesFlow()
+│       │   └── [1] Allocate Pools -> AllocatePoolFlow()
+│       └── (ESC) return -> Page_Main()
+│
+├── Allocate Pages Flow (Boot Services: AllocatePages/FreePages)
+│   └── AllocatePagesFlow()
+│       ├── SelectMemoryType()              // 選 EFI_MEMORY_TYPE（EfiBootServicesData...）
+│       ├── SelectAllocateType()            // 選 EFI_ALLOCATE_TYPE（Any/Max/Address）
+│       ├── PromptU64(Pages)
+│       ├── (if Max/Address) PromptU64(Address)
+│       ├── gBS->AllocatePages()
+│       ├── (optional) Hex Editor -> Page_HexEdit_LimitEdit()
+│       └── (optional) gBS->FreePages()
+│
+├── Allocate Pools Flow (Boot Services: AllocatePool/FreePool)
+│   └── AllocatePoolFlow()
+│       ├── SelectMemoryType()
+│       ├── PromptU64(Bytes)
+│       ├── AllocSize = max(Bytes, 256)     // 顯示固定 16x16（256）
+│       ├── gBS->AllocatePool(AllocSize)
+│       ├── (optional) Hex Editor (Display=AllocSize, EditLimit=Bytes)
+│       └── (optional) gBS->FreePool()
+│
+└── Hex Editor (16x16 = 256 bytes)
+    ├── ReadHexByte()                        // 讀 00~FF（支援 0x / 無 0x）
+    ├── DrawHexEditor2()                     // 畫表格 + 游標 +提示
+    └── Page_HexEdit_LimitEdit()
+        ├── Cursor (page index)              // 0..255
+        ├── BaseOffset (page offset)         // 0,256,512...
+        ├── PgUp/PgDn                         // 翻頁（每頁 0x100）
+        ├── Enter edit (if GlobalIdx < EditSize)
+        └── ESC exit
+```
+
+---
+
+## 2) 系統架構 TXT（System Architecture）
+
+```txt
+[UEFI Shell User]
+   |
+   | (run MemoryApp.efi)
+   v
+[Memory Utility Application]
+   |
+   +--> [Console UI Layer]
+   |      - MenuSelect() / Colors / WaitAnyKey()
+   |
+   +--> [Input Layer]
+   |      - ReadLine() / ParseUint64() / PromptU64() / PromptYesNo()
+   |
+   +--> [Core Services Layer: Boot Services Memory Allocation]
+          - GetMemoryMap()  : 讀系統 Memory Map
+          - AllocatePages() : 以 Page(4KB) 分配
+          - FreePages()     : 釋放 Pages
+          - AllocatePool()  : 以 Byte 分配
+          - FreePool()      : 釋放 Pool
+          |
+          +--> [Hex Editor Module]
+                 - 以 (Buf + BaseOffset + Cursor) 定位 byte
+                 - 顯示 16x16 (256 bytes)
+                 - Pools 模式：顯示>=256，但寫入限制在使用者輸入 Bytes 範圍
+```
+
+---
+
+## 3) 主選單流程 TXT（System & Menu Flow）
+
+```txt
+(1) Start
+    |
+    v
+(2) Main Menu: "<<Select the action>>"
+    ├── [0] Dump Memory Map
+    |     |
+    |     v
+    |   Page_DumpMemoryMap()
+    |     - GetMemoryMap(0) -> BUFFER_TOO_SMALL
+    |     - AllocatePool(MapSize+slack)
+    |     - GetMemoryMap(actual)
+    |     - Print descriptors (分页每20行暂停)
+    |     - Print statistics + Total MB
+    |     - FreePool(Map)
+    |     - Press any key -> back to Main Menu
+    |
+    └── [1] Allocate Memory
+          |
+          v
+        Sub Menu: "<<Select the allocate size>>"
+          ├── [0] Allocate Pages
+          |     |
+          |     v
+          |   AllocatePagesFlow()
+          |     - Select MemoryType
+          |     - Select AllocateType (Any/Max/Address)
+          |     - Input pages
+          |     - (if Max/Address) input address
+          |     - AllocatePages()
+          |     - show address range
+          |     - Edit? (y/n) -> Hex Editor
+          |     - Free? (y/n) -> FreePages() + wait ESC
+          |     - return to Allocate Memory menu
+          |
+          └── [1] Allocate Pools
+                |
+                v
+              AllocatePoolFlow()
+                - Select MemoryType
+                - Input bytes (user requested)
+                - AllocSize = max(bytes,256)  // UI固定顯示16x16
+                - AllocatePool(AllocSize)
+                - show requested range address (Start..Start+bytes-1)
+                - Edit? (y/n) -> Hex Editor
+                     * display uses AllocSize (>=256)
+                     * write limited to bytes
+                - Free? (y/n) -> FreePool() + wait ESC
+                - return to Allocate Memory menu
+
+(3) ESC at Main Menu
+    |
+    v
+(4) Exit Memory Utility
+```
+
+---
+
+
 
 
 cd /d D:\BIOS\MyWorkSpace\edk2
